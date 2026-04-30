@@ -1,0 +1,50 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude / AI tooling — локальный кэш
+.claude/
+.anthropic/
+
+# Секреты и локальные конфиги — на всякий случай
+*.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.crt
+secrets/
+credentials/
+*credentials*
+*password*
+*.kdbx
+
+# Локальные заметки, которые не для коммита
+NOTES.local.md
+TODO.local.md
+scratch/
+draft/
+
+# Архивы и бэкапы конфигов клиентов — никогда сюда
+*.rsc
+*.cfg.bak
+*.backup
+backups/
+
+# Python (если будут вспомогательные скрипты)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node (если будут)
+node_modules/
+package-lock.json

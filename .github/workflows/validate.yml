@@ -1,0 +1,56 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  markdown:
+    name: markdown lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DavidAnson/markdownlint-cli2-action@v16
+        with:
+          globs: |
+            **/*.md
+            !node_modules
+
+  secrets:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config-path: .gitleaks.toml
+
+  custom-checks:
+    name: custom checks (no client data)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: forbid client passport files
+        run: |
+          if find . -name "client-*.md" -not -path "./templates/*" | grep -q .; then
+            echo "ERROR: client-*.md files must not live in the public repo."
+            find . -name "client-*.md" -not -path "./templates/*"
+            exit 1
+          fi
+      - name: forbid common credential patterns in markdown
+        run: |
+          # Грубая, но полезная проверка: явные слова вроде password=, api_key=, токены формата xoxb-/ghp_/sk-
+          PATTERNS='password\s*=|api[_-]?key\s*=|secret\s*=|xoxb-|xoxp-|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}'
+          if grep -rEn --include='*.md' "$PATTERNS" . ; then
+            echo "ERROR: Possible secret in markdown."
+            exit 1
+          fi

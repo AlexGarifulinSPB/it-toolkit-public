@@ -1,0 +1,22 @@
+title = "it-toolkit gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Шаблонные плейсхолдеры в шаблонах и документации не должны срабатывать"
+paths = [
+    '''templates/.*''',
+    '''agents/_template\.md''',
+    '''.*\.md\.example'''
+]
+regexes = [
+    '''<введите_сюда>''',
+    '''<CHANGE_ME>''',
+    '''CHANGEME''',
+    '''10\.0\.\d+\.\d+''',
+    '''192\.168\.\d+\.\d+''',
+    '''172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+''',
+    '''example\.(com|local|lan|test)''',
+    '''KeePass:\s*[a-zA-Z0-9_/-]+'''
+]
