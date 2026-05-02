@@ -43,7 +43,7 @@ usage() {
 EOF
 }
 
-require_root() { [[ \$EUID -eq 0 ]] || { echo "ERROR: запускать под root" >&2; exit 1; }; }
+require_root() { [[ $EUID -eq 0 ]] || { echo "ERROR: запускать под root" >&2; exit 1; }; }
 require_proxmox() {
     command -v ifreload >/dev/null 2>&1 || { echo "ERROR: нет ifreload (ifupdown2)" >&2; exit 1; }
     command -v iptables >/dev/null 2>&1 || { echo "ERROR: нет iptables" >&2; exit 1; }
