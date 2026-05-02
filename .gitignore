@@ -48,3 +48,9 @@ venv/
 # Node (если будут)
 node_modules/
 package-lock.json
+
+# itk-monitoring local test artifacts
+scripts/**/state/
+scripts/**/*.log
+scripts/**/__pycache__/
+scripts/**/.venv/
