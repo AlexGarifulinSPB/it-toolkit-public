@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# Назначение:    создать/удалить изолированный Linux bridge vmbr-itk на узле Proxmox
-#                для PoC автомониторинга.
+# Назначение:    создать/удалить изолированный Linux bridge vmbr-itk на узле Proxmox.
 # Режимы:
-#   обычный (--apply)       bridge без интернета (для злых тестов изоляции)
-#   --with-nat              bridge + NAT через vmbr0 + REJECT в прод-сеть 10.0.0.0/24
-# Использование: см. usage() ниже
-# Требования:    Proxmox VE 7+, root, ifupdown2 (ifreload), iptables
-# Идемпотентность: безопасно запускать повторно, не дублирует правила
-# Опасные операции: правит /etc/network/interfaces. Делает бэкап перед записью.
-#                   Откат: --rollback (сносит и блок, и правила NAT/FORWARD)
+#   --apply              bridge без интернета
+#   --apply --with-nat   bridge + NAT через vmbr0 + REJECT (FORWARD+INPUT) для прод-сети
+#   --rollback / --status / --dry-run
+# Идемпотентность: безопасно запускать повторно
+# Опасные операции: правит /etc/network/interfaces, делает бэкап. Откат: --rollback
 # Автор: it-toolkit, 2026
 
 set -euo pipefail
@@ -18,6 +15,7 @@ BRIDGE_CIDR="${BRIDGE_CIDR:-10.99.0.1/24}"
 BRIDGE_NET="${BRIDGE_NET:-10.99.0.0/24}"
 WAN_BRIDGE="${WAN_BRIDGE:-vmbr0}"
 PROD_NET="${PROD_NET:-10.0.0.0/24}"
+HOST_PROD_IP="${HOST_PROD_IP:-10.0.0.1}"
 
 INTERFACES_FILE="/etc/network/interfaces"
 BACKUP_DIR="/root/itk-backups"
@@ -29,33 +27,25 @@ usage() {
 Использование: $0 [--apply | --apply --with-nat | --rollback | --status | --dry-run [--with-nat]]
 
   --apply              создать $BRIDGE_NAME ($BRIDGE_CIDR), без интернета
-  --apply --with-nat   то же + NAT через $WAN_BRIDGE + REJECT в $PROD_NET
+  --apply --with-nat   то же + NAT через $WAN_BRIDGE + REJECT (FORWARD+INPUT) для $PROD_NET
   --rollback           удалить наш блок + соответствующие правила iptables
   --status             текущее состояние bridge и правил
   --dry-run            показать план без изменений (можно с --with-nat)
   --help               эта справка
 
-Переменные окружения:
-  BRIDGE_NAME   имя bridge (по умолчанию: vmbr-itk)
-  BRIDGE_CIDR   CIDR хоста (по умолчанию: 10.99.0.1/24)
-  BRIDGE_NET    подсеть (по умолчанию: 10.99.0.0/24)
-  WAN_BRIDGE    bridge для NAT (по умолчанию: vmbr0)
-  PROD_NET      какую сеть блокировать на forward (по умолчанию: 10.0.0.0/24)
+Окружение:
+  BRIDGE_NAME=$BRIDGE_NAME
+  BRIDGE_CIDR=$BRIDGE_CIDR
+  BRIDGE_NET=$BRIDGE_NET
+  WAN_BRIDGE=$WAN_BRIDGE
+  PROD_NET=$PROD_NET
+  HOST_PROD_IP=$HOST_PROD_IP
 EOF
 }
 
-require_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo "ERROR: запускать под root" >&2
-        exit 1
-    fi
-}
-
+require_root() { [[ \$EUID -eq 0 ]] || { echo "ERROR: запускать под root" >&2; exit 1; }; }
 require_proxmox() {
-    if ! command -v ifreload >/dev/null 2>&1; then
-        echo "ERROR: не найден ifreload — нужен ifupdown2" >&2
-        exit 1
-    fi
+    command -v ifreload >/dev/null 2>&1 || { echo "ERROR: нет ifreload (ifupdown2)" >&2; exit 1; }
     command -v iptables >/dev/null 2>&1 || { echo "ERROR: нет iptables" >&2; exit 1; }
 }
 
@@ -68,13 +58,8 @@ backup_interfaces() {
     echo "$dest"
 }
 
-block_present() {
-    grep -q "^$MARKER\$" "$INTERFACES_FILE" 2>/dev/null
-}
-
-bridge_up() {
-    ip link show "$BRIDGE_NAME" >/dev/null 2>&1
-}
+block_present() { grep -q "^$MARKER\$" "$INTERFACES_FILE" 2>/dev/null; }
+bridge_up()     { ip link show "$BRIDGE_NAME" >/dev/null 2>&1; }
 
 generate_block() {
     local with_nat="$1"
@@ -90,28 +75,29 @@ iface $BRIDGE_NAME inet static
 EOF
     if [[ "$with_nat" == "yes" ]]; then
         cat <<EOF
-    # forwarding точечно (по образцу vmbr2 на этом узле)
+    # forwarding точечно на этом интерфейсе
     post-up sysctl -w net.ipv4.conf.\$IFACE.forwarding=1 >/dev/null
     post-down sysctl -w net.ipv4.conf.\$IFACE.forwarding=0 >/dev/null
-    # NAT в интернет через $WAN_BRIDGE (с защитой от дублей: -C перед -A)
+    # NAT в интернет через $WAN_BRIDGE
     post-up iptables -t nat -C POSTROUTING -s '$BRIDGE_NET' -o $WAN_BRIDGE -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s '$BRIDGE_NET' -o $WAN_BRIDGE -j MASQUERADE
     post-down iptables -t nat -D POSTROUTING -s '$BRIDGE_NET' -o $WAN_BRIDGE -j MASQUERADE 2>/dev/null || true
-    # ИЗОЛЯЦИЯ: запрет forward в прод-сеть $PROD_NET (в обе стороны)
+    # ИЗОЛЯЦИЯ FORWARD: запрет маршрутизации в прод-сеть $PROD_NET
     post-up iptables -C FORWARD -s '$BRIDGE_NET' -d '$PROD_NET' -j REJECT 2>/dev/null || iptables -I FORWARD 1 -s '$BRIDGE_NET' -d '$PROD_NET' -j REJECT
     post-up iptables -C FORWARD -s '$PROD_NET' -d '$BRIDGE_NET' -j REJECT 2>/dev/null || iptables -I FORWARD 1 -s '$PROD_NET' -d '$BRIDGE_NET' -j REJECT
     post-down iptables -D FORWARD -s '$BRIDGE_NET' -d '$PROD_NET' -j REJECT 2>/dev/null || true
     post-down iptables -D FORWARD -s '$PROD_NET' -d '$BRIDGE_NET' -j REJECT 2>/dev/null || true
+    # ИЗОЛЯЦИЯ INPUT: запрет доступа от $BRIDGE_NET к самому узлу через $HOST_PROD_IP
+    post-up iptables -C INPUT -s '$BRIDGE_NET' -d '$HOST_PROD_IP' -j REJECT 2>/dev/null || iptables -I INPUT 1 -s '$BRIDGE_NET' -d '$HOST_PROD_IP' -j REJECT
+    post-down iptables -D INPUT -s '$BRIDGE_NET' -d '$HOST_PROD_IP' -j REJECT 2>/dev/null || true
 EOF
     fi
     cat <<EOF
 #   Изолированный bridge для PoC автомониторинга.
-#   $MARKER → $END_MARKER
 $END_MARKER
 EOF
 }
 
 remove_block() {
-    # Удаляет всё между MARKER и END_MARKER включительно
     awk -v start="$MARKER" -v end="$END_MARKER" '
         $0 == start { skip=1; next }
         skip && $0 == end { skip=0; next }
@@ -121,10 +107,10 @@ remove_block() {
 }
 
 cleanup_iptables() {
-    # На случай если ifdown post-down не отработал — гарантированная очистка
     iptables -t nat -D POSTROUTING -s "$BRIDGE_NET" -o "$WAN_BRIDGE" -j MASQUERADE 2>/dev/null || true
     iptables -D FORWARD -s "$BRIDGE_NET" -d "$PROD_NET" -j REJECT 2>/dev/null || true
     iptables -D FORWARD -s "$PROD_NET" -d "$BRIDGE_NET" -j REJECT 2>/dev/null || true
+    iptables -D INPUT -s "$BRIDGE_NET" -d "$HOST_PROD_IP" -j REJECT 2>/dev/null || true
 }
 
 cmd_status() {
@@ -132,19 +118,20 @@ cmd_status() {
     if bridge_up; then
         ip -br a show "$BRIDGE_NAME"
         echo
-        echo "=== forwarding на $BRIDGE_NAME ==="
-        sysctl "net.ipv4.conf.${BRIDGE_NAME//-/\/}.forwarding" 2>/dev/null \
-            || sysctl "net.ipv4.conf.$BRIDGE_NAME.forwarding" 2>/dev/null \
-            || echo "(не удалось прочитать)"
+        echo "=== forwarding ==="
+        sysctl "net.ipv4.conf.$BRIDGE_NAME.forwarding" 2>/dev/null || echo "(не удалось прочитать)"
     else
         echo "bridge $BRIDGE_NAME НЕ существует"
     fi
     echo
-    echo "=== iptables NAT для $BRIDGE_NET ==="
+    echo "=== iptables NAT ==="
     iptables -t nat -L POSTROUTING -n -v | grep -E "$BRIDGE_NET" || echo "(нет правил)"
     echo
-    echo "=== iptables FORWARD (изоляция от $PROD_NET) ==="
+    echo "=== iptables FORWARD ==="
     iptables -L FORWARD -n -v | grep -E "$BRIDGE_NET|$PROD_NET" | head -10 || echo "(нет правил)"
+    echo
+    echo "=== iptables INPUT ==="
+    iptables -L INPUT -n -v | grep -E "$BRIDGE_NET.*$HOST_PROD_IP" || echo "(нет правил)"
     echo
     echo "=== запись в $INTERFACES_FILE ==="
     if block_present; then
@@ -165,7 +152,7 @@ cmd_apply() {
     require_proxmox
 
     if block_present; then
-        echo "Блок $BRIDGE_NAME уже есть в $INTERFACES_FILE — удаляю старый, пишу свежий"
+        echo "Блок уже есть — переписываю"
         remove_block
         cleanup_iptables
     fi
@@ -175,94 +162,70 @@ cmd_apply() {
     echo "Бэкап: $backup"
 
     generate_block "$with_nat" >> "$INTERFACES_FILE"
-    echo "Записан блок (with_nat=$with_nat) в $INTERFACES_FILE"
+    echo "Записан блок (with_nat=$with_nat)"
 
-    echo "Валидация конфига..."
+    echo "Валидация..."
     if ! ifup --no-act "$BRIDGE_NAME" >/dev/null 2>&1; then
         echo "ERROR: ifup --no-act $BRIDGE_NAME упал. Откатываю." >&2
         remove_block
-        echo "Восстановите из бэкапа $backup при необходимости." >&2
         exit 1
     fi
-    echo "OK: конфиг валиден"
+    echo "OK"
 
-    echo "Применяю через ifreload..."
+    echo "Применяю ifreload..."
     ifreload -a
 
     sleep 1
     if bridge_up; then
-        echo
         echo "✓ bridge $BRIDGE_NAME поднят:"
         ip -br a show "$BRIDGE_NAME"
         if [[ "$with_nat" == "yes" ]]; then
             echo
-            echo "Проверка NAT:"
-            iptables -t nat -L POSTROUTING -n -v | grep -E "$BRIDGE_NET" || echo "  WARNING: NAT-правило не нашлось"
-            echo
-            echo "Проверка FORWARD-блокировки в $PROD_NET:"
-            iptables -L FORWARD -n -v | grep -E "$BRIDGE_NET.*$PROD_NET|$PROD_NET.*$BRIDGE_NET" \
-                || echo "  WARNING: FORWARD-правил не нашлось"
+            echo "Правила:"
+            iptables -t nat -L POSTROUTING -n -v | grep -E "$BRIDGE_NET" | head -2
+            iptables -L FORWARD -n -v | grep -E "$BRIDGE_NET|$PROD_NET" | head -4
+            iptables -L INPUT -n -v | grep -E "$BRIDGE_NET.*$HOST_PROD_IP" | head -2
         fi
     else
-        echo "ERROR: bridge $BRIDGE_NAME не появился" >&2
-        echo "  journalctl -u networking --since '1 min ago' | tail -50" >&2
+        echo "ERROR: bridge не появился" >&2
         exit 1
     fi
 }
 
 cmd_rollback() {
     require_root
-
     if ! block_present && ! bridge_up; then
-        echo "Нашего блока нет, bridge тоже отсутствует — нечего откатывать."
-        cleanup_iptables  # на всякий случай
+        echo "Нечего откатывать."
+        cleanup_iptables
         exit 0
     fi
-
     local backup
     backup=$(backup_interfaces)
-    echo "Бэкап перед откатом: $backup"
-
+    echo "Бэкап: $backup"
     if bridge_up; then
         ifdown "$BRIDGE_NAME" 2>/dev/null || ip link set "$BRIDGE_NAME" down 2>/dev/null || true
     fi
-
     if block_present; then
         remove_block
-        echo "Блок удалён из $INTERFACES_FILE"
+        echo "Блок удалён"
     fi
-
     cleanup_iptables
     ifreload -a
-
     if bridge_up; then
-        echo "WARNING: bridge $BRIDGE_NAME ещё жив — удаляю принудительно"
+        echo "WARNING: bridge ещё жив — удаляю"
         ip link delete "$BRIDGE_NAME" || true
     fi
-
-    if bridge_up; then
-        echo "ERROR: не удалось снести $BRIDGE_NAME, разбирайся руками" >&2
-        exit 1
-    fi
-    echo "✓ bridge $BRIDGE_NAME удалён, правила NAT/FORWARD очищены"
+    bridge_up && { echo "ERROR: не удалось снести" >&2; exit 1; }
+    echo "✓ bridge удалён, правила очищены"
 }
 
 cmd_dry_run() {
     local with_nat="${1:-no}"
     require_root
-    echo "=== что было бы сделано (with_nat=$with_nat) ==="
-    if block_present; then
-        echo "Блок $BRIDGE_NAME уже в $INTERFACES_FILE — был бы переписан."
-    fi
+    echo "=== план (with_nat=$with_nat) ==="
+    block_present && echo "Блок уже есть — был бы переписан"
     echo "Был бы добавлен блок:"
     generate_block "$with_nat"
-    echo
-    echo "Команды, которые были бы вызваны:"
-    echo "  ifup --no-act $BRIDGE_NAME      # валидация"
-    echo "  ifreload -a                     # применение"
-    if [[ "$with_nat" == "yes" ]]; then
-        echo "  (post-up хуки сами добавят NAT и FORWARD-правила)"
-    fi
 }
 
 main() {
@@ -271,14 +234,13 @@ main() {
     local with_nat="no"
     [[ "$opt" == "--with-nat" || "$action" == "--with-nat" ]] && with_nat="yes"
     [[ "$action" == "--with-nat" ]] && action="--apply"
-
     case "$action" in
         --apply)    cmd_apply "$with_nat" ;;
         --rollback) cmd_rollback ;;
         --status)   cmd_status ;;
         --dry-run)  cmd_dry_run "$with_nat" ;;
         --help|-h)  usage ;;
-        *)          echo "ERROR: неизвестный аргумент: $action" >&2; usage; exit 1 ;;
+        *) echo "ERROR: неизвестный аргумент: $action" >&2; usage; exit 1 ;;
     esac
 }
 
